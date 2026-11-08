@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -82,9 +83,12 @@ func TestOpenReadsUncheckpointedWAL(t *testing.T) {
 			assert.Equal(1, count(t, st, "SELECT count(*) FROM messages WHERE source_message_id = ?", bobMID+":500"))
 		})
 	}
-	entries, err := filepath.Glob(filepath.Join(os.TempDir(), "msgvault-line-*"))
+	opened, err := Open(t.Context(), dir)
 	require.NoError(err)
-	assert.Empty(entries, "scratch copies are removed on Close")
+	require.NotEmpty(opened.scratch, "a store with a log is read from a scratch copy")
+	require.DirExists(opened.scratch)
+	require.NoError(opened.Close())
+	assert.NoDirExists(opened.scratch, "the scratch copy is removed on Close")
 	original, err := os.ReadFile(filepath.Join(dir, "Line.sqlite-wal"))
 	require.NoError(err)
 	assert.Len(original, int(info.Size()), "the source log is never modified")
@@ -95,4 +99,57 @@ func TestOpenRejectsBackupWithSeveralAccounts(t *testing.T) {
 	backup := linetest.WriteBackup(t, t.TempDir(), sampleFixture(), second)
 	_, err := Open(t.Context(), backup)
 	require.ErrorContains(t, err, "holds 2 LINE message stores")
+}
+
+func TestOpenFailsWhenListedWALIsMissing(t *testing.T) {
+	require := require.New(t)
+	f := sampleFixture()
+	f.WALChats = []linetest.Chat{{MID: bobMID, Type: 0, Members: []string{bobMID}, Messages: []linetest.Message{
+		{ID: "500", Millis: 1700000050000, Sender: bobMID, Text: "only in the write-ahead log"},
+	}}}
+	backup := linetest.WriteBackup(t, t.TempDir(), f)
+	opened, err := Open(t.Context(), backup)
+	require.NoError(err)
+	wal := opened.WALPath
+	require.NoError(opened.Close())
+	require.NotEmpty(wal)
+	require.NoError(os.Remove(wal))
+	_, err = Open(t.Context(), backup)
+	require.ErrorContains(err, "names a write-ahead log that is missing")
+}
+
+func TestResumeTracksTheWAL(t *testing.T) {
+	assert, require := assert.New(t), require.New(t)
+	f := sampleFixture()
+	f.WALChats = []linetest.Chat{{MID: bobMID, Type: 0, Members: []string{bobMID}, Messages: []linetest.Message{
+		{ID: "500", Millis: 1700000050000, Sender: bobMID, Text: "only in the write-ahead log"},
+	}}}
+	dir := linetest.Write(t, t.TempDir(), f)
+	wal := filepath.Join(dir, "Line.sqlite-wal")
+
+	t.Run("unchanged log resumes", func(t *testing.T) {
+		st := testutil.NewTestStore(t)
+		summary, err := Import(t.Context(), st, ImportOptions{Path: dir, Limit: 1})
+		require.NoError(err)
+		require.True(summary.LimitReached)
+		summary, err = Import(t.Context(), st, ImportOptions{Path: dir})
+		require.NoError(err)
+		assert.True(summary.WasResumed)
+		assert.EqualValues(9, summary.MessagesAdded)
+	})
+	t.Run("a changed log starts over", func(t *testing.T) {
+		st := testutil.NewTestStore(t)
+		summary, err := Import(t.Context(), st, ImportOptions{Path: dir, Limit: 1})
+		require.NoError(err)
+		require.True(summary.LimitReached)
+		info, err := os.Stat(wal)
+		require.NoError(err)
+		later := info.ModTime().Add(time.Hour)
+		require.NoError(os.Chtimes(wal, later, later))
+		summary, err = Import(t.Context(), st, ImportOptions{Path: dir})
+		require.NoError(err)
+		assert.False(summary.WasResumed, "the main file is unchanged but the log is not")
+		assert.EqualValues(9, summary.MessagesAdded)
+		assert.EqualValues(2, summary.MessagesSkipped, "the first run's message and the fixture's duplicate id")
+	})
 }

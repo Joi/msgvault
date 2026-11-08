@@ -243,22 +243,35 @@ func resolveBackup(ctx context.Context, root string) (main, groups storeFiles, e
 	if _, err := os.Stat(main.db); err != nil {
 		return main, groups, fmt.Errorf("line: the backup manifest names a LINE store that is missing: %w", err)
 	}
-	main.wal = optionalNonEmpty(files[storeFile+walSuffix])
-	groups = storeFiles{db: optionalFile(files[groupsFile])}
-	if groups.db != "" {
-		groups.wal = optionalNonEmpty(files[groupsFile+walSuffix])
+	if main.wal, err = listedWAL(files[storeFile+walSuffix]); err != nil {
+		return main, groups, err
+	}
+	if groups.db = files[groupsFile]; groups.db != "" {
+		if _, err := os.Stat(groups.db); err != nil {
+			return main, groups, fmt.Errorf("line: the backup manifest names a group store that is missing: %w", err)
+		}
+		if groups.wal, err = listedWAL(files[groupsFile+walSuffix]); err != nil {
+			return main, groups, err
+		}
 	}
 	return main, groups, nil
 }
 
-func optionalNonEmpty(path string) string {
+// listedWAL returns a write-ahead log the manifest lists, or "" when it lists
+// none or the log is empty. A listed log whose file is missing is an error:
+// committed rows can live only there.
+func listedWAL(path string) (string, error) {
 	if path == "" {
-		return ""
+		return "", nil
 	}
-	if info, err := os.Stat(path); err == nil && !info.IsDir() && info.Size() > 0 {
-		return path
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("line: the backup manifest names a write-ahead log that is missing: %w", err)
 	}
-	return ""
+	if info.IsDir() || info.Size() == 0 {
+		return "", nil
+	}
+	return path, nil
 }
 
 // openImmutable opens a SQLite file without touching it. Backup copies carry

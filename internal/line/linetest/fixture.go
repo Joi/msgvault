@@ -6,6 +6,7 @@ import (
 	"crypto/sha1" //nolint:gosec // iOS backups name files by the SHA-1 of domain and path
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -48,10 +49,13 @@ type Chat struct {
 }
 
 // Fixture describes a store. Groups are written to UnifiedGroup.sqlite unless
-// NoGroupsFile is set.
+// NoGroupsFile is set. WALChats are written only to the store's write-ahead
+// log, left uncheckpointed beside it as Line.sqlite-wal, the way a backup of
+// a running app can carry them.
 type Fixture struct {
 	Users        []User
 	Chats        []Chat
+	WALChats     []Chat
 	NoGroupsFile bool
 }
 
@@ -79,29 +83,33 @@ func Write(tb testing.TB, dir string, f Fixture) string {
 	return dir
 }
 
-// WriteBackup lays the fixture out as an unencrypted iPhone backup under
-// root: a Manifest.db plus the two stores under their hashed names.
-func WriteBackup(tb testing.TB, root string, f Fixture) string {
+// WriteBackup lays the fixtures out as an unencrypted iPhone backup under
+// root: a Manifest.db plus each account's stores under their hashed names.
+// Every fixture after the first is a further account directory, as a phone
+// that signed in to more than one LINE account leaves behind.
+func WriteBackup(tb testing.TB, root string, accounts ...Fixture) string {
 	tb.Helper()
 	ctx := tb.Context()
 	const domain = "AppDomainGroup-group.com.linecorp.line"
-	const dir = "Library/Application Support/PrivateStore/P_u0123456789abcdef/Messages/"
 	db, err := sql.Open("sqlite3", filepath.Join(root, "Manifest.db"))
 	require.NoError(tb, err)
 	_, err = db.ExecContext(ctx, `CREATE TABLE Files (fileID TEXT PRIMARY KEY, domain TEXT, relativePath TEXT, flags INTEGER, file BLOB)`)
 	require.NoError(tb, err)
-	place := func(name string, write func(path string)) {
-		rel := dir + name
-		sum := sha1.Sum([]byte(domain + "-" + rel)) //nolint:gosec // the backup format's file naming
-		id := hex.EncodeToString(sum[:])
-		require.NoError(tb, os.MkdirAll(filepath.Join(root, id[:2]), 0o755))
-		write(filepath.Join(root, id[:2], id))
-		_, err := db.ExecContext(ctx, `INSERT INTO Files (fileID, domain, relativePath, flags) VALUES (?, ?, ?, 1)`, id, domain, rel)
+	for i, f := range accounts {
+		dir := fmt.Sprintf("Library/Application Support/PrivateStore/P_u%032d/Messages/", i)
+		staging := tb.TempDir()
+		Write(tb, staging, f)
+		entries, err := os.ReadDir(staging)
 		require.NoError(tb, err)
-	}
-	place("Line.sqlite", func(path string) { writeStore(tb, path, f) })
-	if !f.NoGroupsFile {
-		place("UnifiedGroup.sqlite", func(path string) { writeGroups(tb, path, f) })
+		for _, entry := range entries {
+			rel := dir + entry.Name()
+			sum := sha1.Sum([]byte(domain + "-" + rel)) //nolint:gosec // the backup format's file naming
+			id := hex.EncodeToString(sum[:])
+			require.NoError(tb, os.MkdirAll(filepath.Join(root, id[:2]), 0o755))
+			copyFixtureFile(tb, filepath.Join(staging, entry.Name()), filepath.Join(root, id[:2], id))
+			_, err := db.ExecContext(ctx, `INSERT INTO Files (fileID, domain, relativePath, flags) VALUES (?, ?, ?, 1)`, id, domain, rel)
+			require.NoError(tb, err)
+		}
 	}
 	require.NoError(tb, db.Close())
 	return root
@@ -112,7 +120,6 @@ func writeStore(tb testing.TB, path string, f Fixture) {
 	ctx := tb.Context()
 	db, err := sql.Open("sqlite3", path)
 	require.NoError(tb, err)
-	defer func() { require.NoError(tb, db.Close()) }()
 	_, err = db.ExecContext(ctx, storeSchema)
 	require.NoError(tb, err)
 	userRow := map[string]int64{}
@@ -123,21 +130,47 @@ func writeStore(tb testing.TB, path string, f Fixture) {
 			row, u.MID, nullable(u.Name), nullable(u.CustomName), nullable(u.AddressBookName))
 		require.NoError(tb, err)
 	}
-	messageRow := int64(0)
-	for i, c := range f.Chats {
-		chatRow := int64(i + 1)
-		_, err := db.ExecContext(ctx, `INSERT INTO ZCHAT (Z_PK, Z_ENT, ZTYPE, ZMID, ZENABLE) VALUES (?, 1, ?, ?, 1)`, chatRow, c.Type, c.MID)
+	next := insertChats(tb, db, userRow, f.Chats, counters{})
+	require.NoError(tb, db.Close())
+	if len(f.WALChats) == 0 {
+		return
+	}
+	// Rows written in WAL mode stay in the log until a checkpoint; copying
+	// the database and its log while the writer is still open leaves them
+	// there, as a backup of a running app does.
+	staging := filepath.Join(tb.TempDir(), "Line.sqlite")
+	copyFixtureFile(tb, path, staging)
+	require.NoError(tb, os.Remove(path))
+	wal, err := sql.Open("sqlite3", "file:"+staging+"?_journal_mode=WAL")
+	require.NoError(tb, err)
+	wal.SetMaxOpenConns(1)
+	insertChats(tb, wal, userRow, f.WALChats, next)
+	copyFixtureFile(tb, staging, path)
+	copyFixtureFile(tb, staging+"-wal", path+"-wal")
+	require.NoError(tb, wal.Close())
+}
+
+// counters carries the next free ZCHAT and ZMESSAGE row ids between passes.
+type counters struct{ chat, message int64 }
+
+func insertChats(tb testing.TB, db *sql.DB, userRow map[string]int64, chats []Chat, start counters) counters {
+	tb.Helper()
+	ctx := tb.Context()
+	next := start
+	for _, c := range chats {
+		next.chat++
+		_, err := db.ExecContext(ctx, `INSERT INTO ZCHAT (Z_PK, Z_ENT, ZTYPE, ZMID, ZENABLE) VALUES (?, 1, ?, ?, 1)`, next.chat, c.Type, c.MID)
 		require.NoError(tb, err)
 		if c.Type != 2 {
 			for _, mid := range c.Members {
 				row, ok := userRow[mid]
 				require.True(tb, ok, "member %s is not a fixture user", mid)
-				_, err := db.ExecContext(ctx, `INSERT INTO Z_1MEMBERS (Z_1CHATS, Z_12MEMBERS) VALUES (?, ?)`, chatRow, row)
+				_, err := db.ExecContext(ctx, `INSERT INTO Z_1MEMBERS (Z_1CHATS, Z_12MEMBERS) VALUES (?, ?)`, next.chat, row)
 				require.NoError(tb, err)
 			}
 		}
 		for _, m := range c.Messages {
-			messageRow++
+			next.message++
 			var sender any
 			if m.Sender != "" {
 				row, ok := userRow[m.Sender]
@@ -156,10 +189,18 @@ func writeStore(tb testing.TB, path string, f Fixture) {
 				blob = KeyedArchive(tb, m.Metadata)
 			}
 			_, err := db.ExecContext(ctx, `INSERT INTO ZMESSAGE (Z_PK, Z_ENT, ZCONTENTTYPE, ZSENDSTATUS, ZTIMESTAMP, ZCHAT, ZSENDER, ZID, ZTEXT, ZCONTENTMETADATA)
-				VALUES (?, 5, ?, ?, ?, ?, ?, ?, ?, ?)`, messageRow, m.ContentType, status, m.Millis, chatRow, sender, id, nullable(m.Text), blob)
+				VALUES (?, 5, ?, ?, ?, ?, ?, ?, ?, ?)`, next.message, m.ContentType, status, m.Millis, next.chat, sender, id, nullable(m.Text), blob)
 			require.NoError(tb, err)
 		}
 	}
+	return next
+}
+
+func copyFixtureFile(tb testing.TB, from, to string) {
+	tb.Helper()
+	data, err := os.ReadFile(from)
+	require.NoError(tb, err)
+	require.NoError(tb, os.WriteFile(to, data, 0o600)) //nolint:gosec // fixture paths come from the test
 }
 
 func writeGroups(tb testing.TB, path string, f Fixture) {
@@ -172,7 +213,7 @@ func writeGroups(tb testing.TB, path string, f Fixture) {
 	require.NoError(tb, err)
 	userRow := map[string]int64{}
 	groupRow := int64(0)
-	for _, c := range f.Chats {
+	for _, c := range append(append([]Chat{}, f.Chats...), f.WALChats...) {
 		if c.Type != 2 {
 			continue
 		}

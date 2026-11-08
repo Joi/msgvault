@@ -29,7 +29,10 @@ found in an unencrypted iPhone backup.
 
 <path> is the backup directory (the one holding Manifest.db), the Messages
 directory copied out of it, or its Line.sqlite file. UnifiedGroup.sqlite
-beside the store supplies group names and members when present.
+beside the store supplies group names and members when present, and a
+Line.sqlite-wal file beside it is read together with the store. A backup
+that holds the stores of several LINE accounts is refused; copy the one
+Messages directory you want out of it instead.
 
 Text messages, their senders, and replies are archived for direct chats,
 groups, and rooms. The owner is read from the store's Keep Memo chat; pass

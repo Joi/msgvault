@@ -500,7 +500,7 @@ LINE keeps its iPhone history in a Core Data store, `Line.sqlite`, that an unenc
 msgvault import-line "$HOME/Library/Application Support/MobileSync/Backup/<device>"
 ```
 
-The command also accepts the LINE `Messages` directory copied out of a backup, or its `Line.sqlite` file. `UnifiedGroup.sqlite` beside the store supplies group names and member lists; without it, groups keep no title and list only the members who wrote.
+The command also accepts the LINE `Messages` directory copied out of a backup, or its `Line.sqlite` file. `UnifiedGroup.sqlite` beside the store supplies group names and member lists; without it, groups keep no title and list only the members who wrote. A `Line.sqlite-wal` file beside the store is read with it, so messages the phone had not yet folded into the main file are included. The backup files themselves are never modified. A backup that holds stores for more than one LINE account (one `PrivateStore` directory per account that was ever signed in on the phone) is refused; copy the `Messages` directory of the account you want out of the backup and import that.
 
 Direct chats, groups, and rooms become conversations. Text messages are archived with their senders and reply links; rich messages from official accounts keep their readable text. The owner of the account is read from the store's Keep Memo chat. When the store has none, pass your LINE user ID:
 
@@ -510,6 +510,6 @@ msgvault import-line --me u0123456789abcdef0123456789abcdef ./Messages
 
 Photos, videos, files, stickers, calls, and system notices such as joins and unsent messages are counted in the import summary and skipped: the phone's store holds no media bytes, and the other kinds carry no text. Sends that never completed have no message id and are skipped too.
 
-A later backup adds the messages the archive lacks and leaves archived messages unchanged. Messages are keyed by chat and LINE message id. An interrupted import resumes after the last completed chat when the same `Line.sqlite` has the same size and modification time. Use `--no-resume` to scan every chat again, or `--limit N` to cap the messages added in one run.
+A later backup adds the messages the archive lacks and leaves archived messages unchanged. Messages are keyed by chat and LINE message id. An interrupted import resumes after the last completed chat when the same `Line.sqlite` (and its `-wal` file, when present) has the same size and modification time. Use `--no-resume` to scan every chat again, or `--limit N` to cap the messages added in one run.
 
 Encrypted backups are not supported; decrypt or re-make the backup without a password first. LINE for Mac and LINE for Windows keep their own stores and are not read.

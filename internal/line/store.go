@@ -7,9 +7,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -17,6 +19,7 @@ import (
 const (
 	storeFile  = "Line.sqlite"
 	groupsFile = "UnifiedGroup.sqlite"
+	walSuffix  = "-wal"
 	// manifestFile names the index of an iPhone backup made by Finder,
 	// iTunes, or idevicebackup2.
 	manifestFile = "Manifest.db"
@@ -32,64 +35,129 @@ type Store struct {
 	Path string
 	// GroupsPath is the resolved UnifiedGroup.sqlite file, or "" when absent.
 	GroupsPath string
-	db         *sql.DB
-	groups     *sql.DB
+	// WALPath is the message store's write-ahead log, or "" when it has none.
+	WALPath string
+	db      *sql.DB
+	groups  *sql.DB
+	// scratch holds working copies of stores that came with a WAL file; it
+	// is removed on Close.
+	scratch string
+}
+
+// storeFiles is one database and its write-ahead log, when one exists.
+type storeFiles struct {
+	db, wal string
 }
 
 // Open resolves path to a LINE store and opens it read-only. path may be the
 // Line.sqlite file, a directory holding it, or the root of an unencrypted
 // iPhone backup, where the store is found through Manifest.db.
 func Open(ctx context.Context, path string) (*Store, error) {
-	storePath, groupsPath, err := resolve(ctx, path)
+	main, groups, err := resolve(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	db, err := openImmutable(ctx, storePath)
-	if err != nil {
-		return nil, fmt.Errorf("line: open %s: %w", storePath, err)
-	}
-	if err := checkStoreSchema(ctx, db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	st := &Store{Path: storePath, GroupsPath: groupsPath, db: db}
-	if groupsPath != "" {
-		st.groups, err = openImmutable(ctx, groupsPath)
-		if err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("line: open %s: %w", groupsPath, err)
-		}
+	st := &Store{Path: main.db, GroupsPath: groups.db, WALPath: main.wal}
+	if err := st.openAll(ctx, main, groups); err != nil {
+		return nil, errors.Join(err, st.Close())
 	}
 	return st, nil
 }
 
+func (s *Store) openAll(ctx context.Context, main, groups storeFiles) (err error) {
+	s.db, err = s.open(ctx, main)
+	if err != nil {
+		return fmt.Errorf("line: open %s: %w", main.db, err)
+	}
+	if err := checkStoreSchema(ctx, s.db); err != nil {
+		return err
+	}
+	if groups.db != "" {
+		s.groups, err = s.open(ctx, groups)
+		if err != nil {
+			return fmt.Errorf("line: open %s: %w", groups.db, err)
+		}
+	}
+	return nil
+}
+
 func (s *Store) Close() error {
-	err := s.db.Close()
+	var err error
+	if s.db != nil {
+		err = s.db.Close()
+	}
 	if s.groups != nil {
 		err = errors.Join(err, s.groups.Close())
+	}
+	if s.scratch != "" {
+		err = errors.Join(err, os.RemoveAll(s.scratch))
 	}
 	return err
 }
 
-func resolve(ctx context.Context, path string) (storePath, groupsPath string, err error) {
+// open reads a database without touching it. A store that comes with a
+// write-ahead log is copied, log included, to a scratch directory and read
+// there, so committed rows the log still holds are seen; SQLite's immutable
+// mode, which never looks for a log, reads the original otherwise.
+func (s *Store) open(ctx context.Context, files storeFiles) (*sql.DB, error) {
+	if files.wal == "" {
+		return openImmutable(ctx, files.db)
+	}
+	if s.scratch == "" {
+		dir, err := os.MkdirTemp("", "msgvault-line-")
+		if err != nil {
+			return nil, err
+		}
+		s.scratch = dir
+	}
+	copyTo := filepath.Join(s.scratch, filepath.Base(files.db))
+	if err := copyFile(files.db, copyTo); err != nil {
+		return nil, err
+	}
+	if err := copyFile(files.wal, copyTo+walSuffix); err != nil {
+		return nil, err
+	}
+	return openCopy(ctx, copyTo)
+}
+
+func copyFile(from, to string) error {
+	src, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = src.Close() }()
+	dst, err := os.OpenFile(to, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		_ = dst.Close()
+		return err
+	}
+	return dst.Close()
+}
+
+// resolve finds the message store and, when present, the group store and
+// their write-ahead logs.
+func resolve(ctx context.Context, path string) (main, groups storeFiles, err error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return "", "", err
+		return main, groups, err
 	}
 	info, err := os.Stat(abs)
 	if err != nil {
-		return "", "", fmt.Errorf("line: %w", err)
+		return main, groups, fmt.Errorf("line: %w", err)
 	}
 	if !info.IsDir() {
-		return abs, optionalFile(filepath.Join(filepath.Dir(abs), groupsFile)), nil
+		return withWAL(abs), withWAL(optionalFile(filepath.Join(filepath.Dir(abs), groupsFile))), nil
 	}
 	if _, err := os.Stat(filepath.Join(abs, storeFile)); err == nil {
-		return filepath.Join(abs, storeFile), optionalFile(filepath.Join(abs, groupsFile)), nil
+		return withWAL(filepath.Join(abs, storeFile)), withWAL(optionalFile(filepath.Join(abs, groupsFile))), nil
 	}
 	if _, err := os.Stat(filepath.Join(abs, manifestFile)); err == nil {
 		return resolveBackup(ctx, abs)
 	}
-	return "", "", fmt.Errorf("line: %s holds neither %s nor %s", abs, storeFile, manifestFile)
+	return main, groups, fmt.Errorf("line: %s holds neither %s nor %s", abs, storeFile, manifestFile)
 }
 
 func optionalFile(path string) string {
@@ -99,60 +167,119 @@ func optionalFile(path string) string {
 	return ""
 }
 
+// withWAL pairs a database with a non-empty write-ahead log beside it.
+func withWAL(db string) storeFiles {
+	if db == "" {
+		return storeFiles{}
+	}
+	files := storeFiles{db: db}
+	if info, err := os.Stat(db + walSuffix); err == nil && !info.IsDir() && info.Size() > 0 {
+		files.wal = db + walSuffix
+	}
+	return files
+}
+
 // resolveBackup finds the LINE store inside an iPhone backup. Backup files
 // are stored under the SHA-1 of "<domain>-<relative path>", in a directory
-// named by the hash's first two characters. Manifest.db lists them.
-func resolveBackup(ctx context.Context, root string) (storePath, groupsPath string, err error) {
+// named by the hash's first two characters. Manifest.db lists them. LINE
+// keeps one PrivateStore directory per account that was signed in on the
+// phone, so the backup must hold exactly one message store.
+func resolveBackup(ctx context.Context, root string) (main, groups storeFiles, err error) {
 	manifest, err := openImmutable(ctx, filepath.Join(root, manifestFile))
 	if err != nil {
-		return "", "", fmt.Errorf("line: open backup manifest: %w", err)
+		return main, groups, fmt.Errorf("line: open backup manifest: %w", err)
 	}
 	defer func() { _ = manifest.Close() }()
 	rows, err := manifest.QueryContext(ctx, `SELECT relativePath FROM Files WHERE domain = ? AND relativePath LIKE ?`,
-		backupDomain, backupPath+"%/Messages/%.sqlite")
+		backupDomain, backupPath+"%/Messages/%")
 	if err != nil {
 		if strings.Contains(err.Error(), "not a database") {
-			return "", "", errors.New("line: the backup manifest is not readable; encrypted backups are not supported")
+			return main, groups, errors.New("line: the backup manifest is not readable; encrypted backups are not supported")
 		}
-		return "", "", fmt.Errorf("line: read backup manifest: %w", err)
+		return main, groups, fmt.Errorf("line: read backup manifest: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
+	// byDir maps each account's Messages directory to the backup files of
+	// the two stores and their logs, keyed by file name.
+	byDir := map[string]map[string]string{}
 	for rows.Next() {
 		var rel string
 		if err := rows.Scan(&rel); err != nil {
-			return "", "", err
+			return main, groups, err
+		}
+		name := filepath.Base(rel)
+		switch name {
+		case storeFile, groupsFile, storeFile + walSuffix, groupsFile + walSuffix:
+		default:
+			continue
 		}
 		sum := sha1.Sum([]byte(backupDomain + "-" + rel)) //nolint:gosec // the backup format's file naming, not a security use
 		id := hex.EncodeToString(sum[:])
-		file := filepath.Join(root, id[:2], id)
-		switch filepath.Base(rel) {
-		case storeFile:
-			storePath = file
-		case groupsFile:
-			groupsPath = optionalFile(file)
+		dir := filepath.Dir(rel)
+		if byDir[dir] == nil {
+			byDir[dir] = map[string]string{}
 		}
+		byDir[dir][name] = filepath.Join(root, id[:2], id)
 	}
 	if err := rows.Err(); err != nil {
-		return "", "", err
+		return main, groups, err
 	}
-	if storePath == "" {
-		return "", "", fmt.Errorf("line: the backup at %s has no LINE message store", root)
+	var dirs []string
+	for dir, files := range byDir {
+		if files[storeFile] != "" {
+			dirs = append(dirs, dir)
+		}
 	}
-	if _, err := os.Stat(storePath); err != nil {
-		return "", "", fmt.Errorf("line: the backup manifest names a LINE store that is missing: %w", err)
+	sort.Strings(dirs)
+	switch len(dirs) {
+	case 0:
+		return main, groups, fmt.Errorf("line: the backup at %s has no LINE message store", root)
+	case 1:
+	default:
+		return main, groups, fmt.Errorf("line: the backup at %s holds %d LINE message stores, one per account signed in on the phone; copy the Messages directory of the account you want out of the backup and import that directory", root, len(dirs))
 	}
-	return storePath, groupsPath, nil
+	files := byDir[dirs[0]]
+	main = storeFiles{db: files[storeFile]}
+	if _, err := os.Stat(main.db); err != nil {
+		return main, groups, fmt.Errorf("line: the backup manifest names a LINE store that is missing: %w", err)
+	}
+	main.wal = optionalNonEmpty(files[storeFile+walSuffix])
+	groups = storeFiles{db: optionalFile(files[groupsFile])}
+	if groups.db != "" {
+		groups.wal = optionalNonEmpty(files[groupsFile+walSuffix])
+	}
+	return main, groups, nil
+}
+
+func optionalNonEmpty(path string) string {
+	if path == "" {
+		return ""
+	}
+	if info, err := os.Stat(path); err == nil && !info.IsDir() && info.Size() > 0 {
+		return path
+	}
+	return ""
 }
 
 // openImmutable opens a SQLite file without touching it. Backup copies carry
 // a WAL header but no -wal or -shm files, which a normal read-only open
 // would try to create.
 func openImmutable(ctx context.Context, path string) (*sql.DB, error) {
+	return openDSN(ctx, path, "immutable=1&_query_only=1")
+}
+
+// openCopy opens a scratch copy read-only; SQLite applies the copied
+// write-ahead log and keeps its index in the scratch directory.
+func openCopy(ctx context.Context, path string) (*sql.DB, error) {
+	return openDSN(ctx, path, "mode=ro&_query_only=1")
+}
+
+func openDSN(ctx context.Context, path, rawQuery string) (*sql.DB, error) {
 	uriPath := filepath.ToSlash(path)
 	if !strings.HasPrefix(uriPath, "/") {
 		uriPath = "/" + uriPath
 	}
-	dsn := (&url.URL{Scheme: "file", Path: uriPath, RawQuery: "immutable=1&_query_only=1"}).String()
+	dsn := (&url.URL{Scheme: "file", Path: uriPath, RawQuery: rawQuery}).String()
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, err

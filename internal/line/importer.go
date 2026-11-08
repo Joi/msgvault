@@ -23,6 +23,8 @@ type lineCheckpoint struct {
 	StorePath    string `json:"store_path"`
 	StoreSize    int64  `json:"store_size"`
 	StoreModTime int64  `json:"store_mod_time"`
+	WALSize      int64  `json:"wal_size,omitempty"`
+	WALModTime   int64  `json:"wal_mod_time,omitempty"`
 	NextChat     int    `json:"next_chat"`
 }
 
@@ -94,6 +96,13 @@ func Import(ctx context.Context, st *store.Store, opts ImportOptions) (summary *
 	}
 	summary.SourceID = source.ID
 	cp := lineCheckpoint{Version: checkpointVersion, StorePath: reader.Path, StoreSize: info.Size(), StoreModTime: info.ModTime().UnixNano()}
+	if reader.WALPath != "" {
+		wal, err := os.Stat(reader.WALPath)
+		if err != nil {
+			return summary, err
+		}
+		cp.WALSize, cp.WALModTime = wal.Size(), wal.ModTime().UnixNano()
+	}
 	if !opts.NoResume {
 		prev, err := st.GetLatestCheckpointedSyncByType(ctx, source.ID, syncType)
 		if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
@@ -107,7 +116,7 @@ func Import(ctx context.Context, st *store.Store, opts ImportOptions) (summary *
 			if prior.Version > checkpointVersion {
 				return summary, fmt.Errorf("line: checkpoint version %d is newer than supported; use --no-resume", prior.Version)
 			}
-			if prior.Version == checkpointVersion && prior.StorePath == cp.StorePath && prior.StoreSize == cp.StoreSize && prior.StoreModTime == cp.StoreModTime {
+			if prior.Version == checkpointVersion && prior.StorePath == cp.StorePath && prior.StoreSize == cp.StoreSize && prior.StoreModTime == cp.StoreModTime && prior.WALSize == cp.WALSize && prior.WALModTime == cp.WALModTime {
 				cp.NextChat = prior.NextChat
 				summary.WasResumed = true
 			}

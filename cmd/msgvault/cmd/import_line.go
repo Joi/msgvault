@@ -104,11 +104,11 @@ func runImportLine(cmd *cobra.Command, path string, opts lineCLIOptions) error {
 		NoResume: opts.NoResume,
 		Logger:   state.logger,
 	})
-	err = errors.Join(err, runExportPostImportMigrations(ctx, cmd.OutOrStdout(), s, summary.SourceID, opts.NoDefaultIdentity, state))
+	err = errors.Join(err, runExportPostImportMigrations(cmd.OutOrStdout(), s, summary.SourceID, opts.NoDefaultIdentity, state))
 	if err != nil {
 		var cacheErr error
 		if summary.SourceID != 0 {
-			cacheErr = rebuildCacheAfterWrite(ctx, dbPath, state)
+			cacheErr = rebuildCacheAfterWrite(dbPath, state)
 		}
 		if ctx.Err() != nil {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "\nImport interrupted. Re-run to continue.")
@@ -142,7 +142,7 @@ func runImportLine(cmd *cobra.Command, path string, opts lineCLIOptions) error {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  Unsupported skipped: %d\n", summary.UnsupportedSkipped)
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  Participants:     %d\n", summary.ParticipantsResolved)
-	return rebuildCacheAfterWrite(ctx, dbPath, state)
+	return rebuildCacheAfterWrite(dbPath, state)
 }
 
 func init() {

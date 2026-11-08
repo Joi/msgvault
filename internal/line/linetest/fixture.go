@@ -11,7 +11,7 @@ import (
 	"sort"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3" // registers the sqlite3 driver the fixtures are written with
 	"github.com/stretchr/testify/require"
 	"howett.net/plist"
 )
@@ -70,68 +70,70 @@ CREATE TABLE ZUNIFIEDGROUPUSER ( Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, Z_OPT 
 `
 
 // Write creates Line.sqlite (and UnifiedGroup.sqlite) in dir and returns dir.
-func Write(t testing.TB, dir string, f Fixture) string {
-	t.Helper()
-	writeStore(t, filepath.Join(dir, "Line.sqlite"), f)
+func Write(tb testing.TB, dir string, f Fixture) string {
+	tb.Helper()
+	writeStore(tb, filepath.Join(dir, "Line.sqlite"), f)
 	if !f.NoGroupsFile {
-		writeGroups(t, filepath.Join(dir, "UnifiedGroup.sqlite"), f)
+		writeGroups(tb, filepath.Join(dir, "UnifiedGroup.sqlite"), f)
 	}
 	return dir
 }
 
 // WriteBackup lays the fixture out as an unencrypted iPhone backup under
 // root: a Manifest.db plus the two stores under their hashed names.
-func WriteBackup(t testing.TB, root string, f Fixture) string {
-	t.Helper()
+func WriteBackup(tb testing.TB, root string, f Fixture) string {
+	tb.Helper()
+	ctx := tb.Context()
 	const domain = "AppDomainGroup-group.com.linecorp.line"
 	const dir = "Library/Application Support/PrivateStore/P_u0123456789abcdef/Messages/"
 	db, err := sql.Open("sqlite3", filepath.Join(root, "Manifest.db"))
-	require.NoError(t, err)
-	_, err = db.Exec(`CREATE TABLE Files (fileID TEXT PRIMARY KEY, domain TEXT, relativePath TEXT, flags INTEGER, file BLOB)`)
-	require.NoError(t, err)
+	require.NoError(tb, err)
+	_, err = db.ExecContext(ctx, `CREATE TABLE Files (fileID TEXT PRIMARY KEY, domain TEXT, relativePath TEXT, flags INTEGER, file BLOB)`)
+	require.NoError(tb, err)
 	place := func(name string, write func(path string)) {
 		rel := dir + name
 		sum := sha1.Sum([]byte(domain + "-" + rel)) //nolint:gosec // the backup format's file naming
 		id := hex.EncodeToString(sum[:])
-		require.NoError(t, os.MkdirAll(filepath.Join(root, id[:2]), 0o755))
+		require.NoError(tb, os.MkdirAll(filepath.Join(root, id[:2]), 0o755))
 		write(filepath.Join(root, id[:2], id))
-		_, err := db.Exec(`INSERT INTO Files (fileID, domain, relativePath, flags) VALUES (?, ?, ?, 1)`, id, domain, rel)
-		require.NoError(t, err)
+		_, err := db.ExecContext(ctx, `INSERT INTO Files (fileID, domain, relativePath, flags) VALUES (?, ?, ?, 1)`, id, domain, rel)
+		require.NoError(tb, err)
 	}
-	place("Line.sqlite", func(path string) { writeStore(t, path, f) })
+	place("Line.sqlite", func(path string) { writeStore(tb, path, f) })
 	if !f.NoGroupsFile {
-		place("UnifiedGroup.sqlite", func(path string) { writeGroups(t, path, f) })
+		place("UnifiedGroup.sqlite", func(path string) { writeGroups(tb, path, f) })
 	}
-	require.NoError(t, db.Close())
+	require.NoError(tb, db.Close())
 	return root
 }
 
-func writeStore(t testing.TB, path string, f Fixture) {
-	t.Helper()
+func writeStore(tb testing.TB, path string, f Fixture) {
+	tb.Helper()
+	ctx := tb.Context()
 	db, err := sql.Open("sqlite3", path)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, db.Close()) }()
-	_, err = db.Exec(storeSchema)
-	require.NoError(t, err)
+	require.NoError(tb, err)
+	defer func() { require.NoError(tb, db.Close()) }()
+	_, err = db.ExecContext(ctx, storeSchema)
+	require.NoError(tb, err)
 	userRow := map[string]int64{}
 	for i, u := range f.Users {
 		row := int64(i + 1)
 		userRow[u.MID] = row
-		_, err := db.Exec(`INSERT INTO ZUSER (Z_PK, Z_ENT, ZMID, ZNAME, ZCUSTOMNAME, ZADDRESSBOOKNAME) VALUES (?, 12, ?, ?, ?, ?)`,
+		_, err := db.ExecContext(ctx, `INSERT INTO ZUSER (Z_PK, Z_ENT, ZMID, ZNAME, ZCUSTOMNAME, ZADDRESSBOOKNAME) VALUES (?, 12, ?, ?, ?, ?)`,
 			row, u.MID, nullable(u.Name), nullable(u.CustomName), nullable(u.AddressBookName))
-		require.NoError(t, err)
+		require.NoError(tb, err)
 	}
 	messageRow := int64(0)
 	for i, c := range f.Chats {
 		chatRow := int64(i + 1)
-		_, err := db.Exec(`INSERT INTO ZCHAT (Z_PK, Z_ENT, ZTYPE, ZMID, ZENABLE) VALUES (?, 1, ?, ?, 1)`, chatRow, c.Type, c.MID)
-		require.NoError(t, err)
+		_, err := db.ExecContext(ctx, `INSERT INTO ZCHAT (Z_PK, Z_ENT, ZTYPE, ZMID, ZENABLE) VALUES (?, 1, ?, ?, 1)`, chatRow, c.Type, c.MID)
+		require.NoError(tb, err)
 		if c.Type != 2 {
 			for _, mid := range c.Members {
 				row, ok := userRow[mid]
-				require.True(t, ok, "member %s is not a fixture user", mid)
-				_, err := db.Exec(`INSERT INTO Z_1MEMBERS (Z_1CHATS, Z_12MEMBERS) VALUES (?, ?)`, chatRow, row)
-				require.NoError(t, err)
+				require.True(tb, ok, "member %s is not a fixture user", mid)
+				_, err := db.ExecContext(ctx, `INSERT INTO Z_1MEMBERS (Z_1CHATS, Z_12MEMBERS) VALUES (?, ?)`, chatRow, row)
+				require.NoError(tb, err)
 			}
 		}
 		for _, m := range c.Messages {
@@ -139,7 +141,7 @@ func writeStore(t testing.TB, path string, f Fixture) {
 			var sender any
 			if m.Sender != "" {
 				row, ok := userRow[m.Sender]
-				require.True(t, ok, "sender %s is not a fixture user", m.Sender)
+				require.True(tb, ok, "sender %s is not a fixture user", m.Sender)
 				sender = row
 			}
 			var id any
@@ -151,22 +153,23 @@ func writeStore(t testing.TB, path string, f Fixture) {
 			}
 			var blob any
 			if len(m.Metadata) > 0 {
-				blob = KeyedArchive(t, m.Metadata)
+				blob = KeyedArchive(tb, m.Metadata)
 			}
-			_, err := db.Exec(`INSERT INTO ZMESSAGE (Z_PK, Z_ENT, ZCONTENTTYPE, ZSENDSTATUS, ZTIMESTAMP, ZCHAT, ZSENDER, ZID, ZTEXT, ZCONTENTMETADATA)
+			_, err := db.ExecContext(ctx, `INSERT INTO ZMESSAGE (Z_PK, Z_ENT, ZCONTENTTYPE, ZSENDSTATUS, ZTIMESTAMP, ZCHAT, ZSENDER, ZID, ZTEXT, ZCONTENTMETADATA)
 				VALUES (?, 5, ?, ?, ?, ?, ?, ?, ?, ?)`, messageRow, m.ContentType, status, m.Millis, chatRow, sender, id, nullable(m.Text), blob)
-			require.NoError(t, err)
+			require.NoError(tb, err)
 		}
 	}
 }
 
-func writeGroups(t testing.TB, path string, f Fixture) {
-	t.Helper()
+func writeGroups(tb testing.TB, path string, f Fixture) {
+	tb.Helper()
+	ctx := tb.Context()
 	db, err := sql.Open("sqlite3", path)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, db.Close()) }()
-	_, err = db.Exec(groupsSchema)
-	require.NoError(t, err)
+	require.NoError(tb, err)
+	defer func() { require.NoError(tb, db.Close()) }()
+	_, err = db.ExecContext(ctx, groupsSchema)
+	require.NoError(tb, err)
 	userRow := map[string]int64{}
 	groupRow := int64(0)
 	for _, c := range f.Chats {
@@ -174,18 +177,18 @@ func writeGroups(t testing.TB, path string, f Fixture) {
 			continue
 		}
 		groupRow++
-		_, err := db.Exec(`INSERT INTO ZUNIFIEDGROUP (Z_PK, Z_ENT, ZID, ZNAME) VALUES (?, 1, ?, ?)`, groupRow, c.MID, nullable(c.Name))
-		require.NoError(t, err)
+		_, err := db.ExecContext(ctx, `INSERT INTO ZUNIFIEDGROUP (Z_PK, Z_ENT, ZID, ZNAME) VALUES (?, 1, ?, ?)`, groupRow, c.MID, nullable(c.Name))
+		require.NoError(tb, err)
 		for _, mid := range c.Members {
 			row, ok := userRow[mid]
 			if !ok {
 				row = int64(len(userRow) + 1)
 				userRow[mid] = row
-				_, err := db.Exec(`INSERT INTO ZUNIFIEDGROUPUSER (Z_PK, Z_ENT, ZMID) VALUES (?, 2, ?)`, row, mid)
-				require.NoError(t, err)
+				_, err := db.ExecContext(ctx, `INSERT INTO ZUNIFIEDGROUPUSER (Z_PK, Z_ENT, ZMID) VALUES (?, 2, ?)`, row, mid)
+				require.NoError(tb, err)
 			}
-			_, err := db.Exec(`INSERT INTO Z_1MEMBERCHATUSERS (Z_1GROUPS, Z_2MEMBERCHATUSERS) VALUES (?, ?)`, groupRow, row)
-			require.NoError(t, err)
+			_, err := db.ExecContext(ctx, `INSERT INTO Z_1MEMBERCHATUSERS (Z_1GROUPS, Z_2MEMBERCHATUSERS) VALUES (?, ?)`, groupRow, row)
+			require.NoError(tb, err)
 		}
 	}
 }
@@ -200,8 +203,8 @@ func nullable(s string) any {
 // KeyedArchive encodes a string dictionary the way NSKeyedArchiver does:
 // a binary plist whose $objects table holds the keys and values, with the
 // root dictionary referring to them by UID.
-func KeyedArchive(t testing.TB, entries map[string]string) []byte {
-	t.Helper()
+func KeyedArchive(tb testing.TB, entries map[string]string) []byte {
+	tb.Helper()
 	keys := make([]string, 0, len(entries))
 	for k := range entries {
 		keys = append(keys, k)
@@ -215,7 +218,7 @@ func KeyedArchive(t testing.TB, entries map[string]string) []byte {
 		objects = append(objects, entries[k])
 		valueUIDs = append(valueUIDs, plist.UID(len(objects)-1)) //nolint:gosec // small test slice
 	}
-	classUID := plist.UID(len(objects) + 1) //nolint:gosec // small test slice
+	classUID := plist.UID(len(objects) + 1)
 	objects = append(objects, map[string]any{"NS.keys": keyUIDs, "NS.objects": valueUIDs, "$class": classUID})
 	rootUID := plist.UID(len(objects) - 1) //nolint:gosec // small test slice
 	objects = append(objects, map[string]any{"$classname": "NSMutableDictionary", "$classes": []string{"NSMutableDictionary", "NSDictionary", "NSObject"}})
@@ -226,6 +229,6 @@ func KeyedArchive(t testing.TB, entries map[string]string) []byte {
 		"$objects":  objects,
 	}
 	blob, err := plist.Marshal(archive, plist.BinaryFormat)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	return blob
 }

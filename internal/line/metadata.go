@@ -29,7 +29,7 @@ func decodeMetadata(blob []byte) metadata {
 		return md
 	}
 	resolve := func(v any) any {
-		if uid, ok := v.(plist.UID); ok && uid < plist.UID(len(archive.Objects)) { //nolint:gosec // bounded by the slice length
+		if uid, ok := v.(plist.UID); ok && uid < plist.UID(len(archive.Objects)) {
 			return archive.Objects[uid]
 		}
 		return v

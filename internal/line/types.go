@@ -65,6 +65,8 @@ func (k chatKind) conversationType() string {
 		return "direct_chat"
 	case chatRoom, chatGroup:
 		return "group_chat"
+	case chatUnknown:
+		return ""
 	}
 	return ""
 }

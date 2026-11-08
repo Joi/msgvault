@@ -53,7 +53,11 @@ Examples:
 			if opts.Limit < 0 {
 				return errors.New("--limit must be non-negative")
 			}
-			if !isDaemonCLISubprocess() {
+			// Fork-only: MSGVAULT_LINE_DIRECT=1 writes to the archive from this
+			// process under the direct write-owner lock, for a LINE import run
+			// while the release daemon is stopped (the release binary has no
+			// import-line, so the daemon cannot run it as a subprocess).
+			if !isDaemonCLISubprocess() && os.Getenv("MSGVAULT_LINE_DIRECT") != "1" {
 				return runDaemonCLICommandHTTPFromCobraWithLocalFiles(cmd, args, nil)
 			}
 			return runImportLine(cmd, args[0], opts)
@@ -77,7 +81,7 @@ func runImportLine(cmd *cobra.Command, path string, opts lineCLIOptions) error {
 	}
 
 	dbPath := cfg.DatabaseDSN()
-	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(cmd.Context(), state)
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 	if err != nil {
 		return err
 	}

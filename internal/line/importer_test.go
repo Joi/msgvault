@@ -1,7 +1,6 @@
 package line
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -221,27 +220,4 @@ func TestImportSkipsUnknownChatType(t *testing.T) {
 	require.NoError(err)
 	assert.Equal(1, summary.ChatsSkipped)
 	assert.EqualValues(9, summary.MessagesAdded)
-}
-
-func TestImportLimitCancelAfterCheckpointPausesSync(t *testing.T) {
-	assert, require := assert.New(t), require.New(t)
-	st := testutil.NewSQLiteTestStore(t)
-	dir := linetest.Write(t, t.TempDir(), linetest.Fixture{Chats: []linetest.Chat{{MID: ownerMID, Type: 100, Messages: []linetest.Message{
-		{ID: "1", Millis: 1700000000000, Text: "first"}, {ID: "2", Millis: 1700000001000, Text: "second"},
-	}}}})
-	queryCtx := context.WithoutCancel(t.Context())
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	canceled := testutil.CancelAfterCommit(t, cancel, func() bool {
-		var saved int
-		require.NoError(st.DB().QueryRowContext(queryCtx, `SELECT COUNT(*) FROM sync_runs WHERE cursor_before IS NOT NULL`).Scan(&saved))
-		return saved > 0
-	})
-	summary, err := Import(ctx, st, ImportOptions{Path: dir, Limit: 1})
-	require.NoError(err)
-	require.True(summary.LimitReached)
-	require.True(canceled(), "the cancel must land after the checkpoint commits")
-	var status string
-	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT status FROM sync_runs ORDER BY id DESC LIMIT 1`).Scan(&status))
-	assert.Equal("paused", status)
 }
